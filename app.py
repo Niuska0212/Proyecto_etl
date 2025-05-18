@@ -5,20 +5,23 @@ import pandas as pd
 import plotly.express as px
 import base64
 import io
+import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler, StandardScaler
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.metrics import (accuracy_score, classification_report, 
                             confusion_matrix, precision_score, 
                             recall_score, f1_score, roc_auc_score)
 from sklearn.cluster import KMeans
+import json
 
-# Inicializar la aplicación Dash
+# Inicializar  Dash
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 app.title = "Sistema ETL para Reservas Hoteleras"
 
-# ============ Funciones de procesamiento mejoradas ============
+# ============ Funciones de procesamiento ============
 
 def clean_data(df):
     """Limpieza de datos adaptada para Dash"""
@@ -46,43 +49,94 @@ def clean_data(df):
         return None
 
 def transform_data(df):
-
     if df is None:
         return None
     try:
-        # Crear columna de fecha combinada para análisis estacional
-        if all(col in df.columns for col in ['arrival_date_year', 'arrival_date_month', 'arrival_date_day_of_month']):
-            # Convertir nombre de mes a número si es necesario
-            if df['arrival_date_month'].dtype == object:
-                df['arrival_date_month'] = df['arrival_date_month'].apply(
-                    lambda x: pd.to_datetime(x, format='%B').month if not str(x).isdigit() else int(x)
-                )
-            df['arrival_date'] = pd.to_datetime(
-                df['arrival_date_year'].astype(str) + '-' +
-                df['arrival_date_month'].astype(str) + '-' +
-                df['arrival_date_day_of_month'].astype(str),
-                errors='coerce'
-            )
-        
-        # Crear nuevas columnas
+        # 1. Creación de total_nights (como ya lo teníamos)
         if all(col in df.columns for col in ['stays_in_weekend_nights', 'stays_in_week_nights']):
-            df['total_nights'] = df['stays_in_week_nights'] + df['stays_in_weekend_nights']
+            if 'total_nights' not in df.columns:
+                df['total_nights'] = df['stays_in_week_nights'] + df['stays_in_weekend_nights']
         
-        # Codificar variables categóricas
-        categorical_cols = df.select_dtypes(include=['object']).columns
+        # 2. Creación de arrival_date
+        date_cols = ['arrival_date_year', 'arrival_date_month', 'arrival_date_day_of_month']
+        if all(col in df.columns for col in date_cols):
+            # Convertir mes a numérico si es texto
+            if pd.api.types.is_string_dtype(df['arrival_date_month']):
+                month_map = {
+                    'January': 1, 'February': 2, 'March': 3, 'April': 4, 'May': 5, 'June': 6,
+                    'July': 7, 'August': 8, 'September': 9, 'October': 10, 'November': 11, 'December': 12
+                }
+                df['arrival_date_month'] = df['arrival_date_month'].map(month_map)
+                
+                # Si algún mes no se mapeó, intentar convertir directamente a número
+                df['arrival_date_month'] = pd.to_numeric(df['arrival_date_month'], errors='coerce')
+            
+            # make sure que todos los componentes son numéricos
+            df[date_cols] = df[date_cols].apply(pd.to_numeric, errors='coerce')
+            
+            # Filtrar filas con valores nulos en las columnas de fecha
+            df = df.dropna(subset=date_cols)
+            
+            # Crear la fecha de llegada con verificación de errores
+            try:
+                df['arrival_date'] = pd.to_datetime(
+                    df['arrival_date_year'].astype(str) + '-' +
+                    df['arrival_date_month'].astype(str) + '-' +
+                    df['arrival_date_day_of_month'].astype(str),
+                    errors='coerce'
+                )
+                
+                # Eliminar filas con fechas inválidas
+                df = df[df['arrival_date'].notna()]
+            except Exception as e:
+                print(f"Error creando arrival_date: {e}")
+        else:
+            print(f"Faltan columnas de fecha. Se necesitan: {date_cols}")
+
+        # 3. Codificación de variables categóricas
+        categorical_cols = [col for col in df.select_dtypes(include=['object', 'category']).columns 
+                          if col != 'country' and df[col].nunique() < 20]
+        
         for col in categorical_cols:
-            if df[col].nunique() < 20:  # Solo codificar si hay pocas categorías
+            df[col] = df[col].fillna('MISSING')
+            try:
                 le = LabelEncoder()
-                df[col] = le.fit_transform(df[col])
-        
-        # Normalizar columnas numéricas clave
-        numeric_cols = ['adr', 'lead_time', 'total_nights']
+                df[col] = le.fit_transform(df[col].astype(str))
+            except:
+                df[col] = df[col].astype('category').cat.codes
+
+        # 4. Normalización de columnas numéricas con verificación
+        numeric_cols = [col for col in ['adr', 'lead_time', 'total_nights'] 
+                       if col in df.columns and col != 'country']
         scaler = MinMaxScaler()
+        
         for col in numeric_cols:
             if col in df.columns:
-                df[col] = scaler.fit_transform(df[[col]])
-        
+                # Verificar si la columna existe y tiene valores válidos
+                if not pd.api.types.is_numeric_dtype(df[col]):
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    except:
+                        continue
+                
+                # Rellenar nulos con la mediana antes de normalizar
+                if df[col].isnull().any():
+                    df[col] = df[col].fillna(df[col].median())
+                
+                # Normalizar solo si hay valores no nulos
+                if not df[col].empty:
+                    try:
+                        df[col] = scaler.fit_transform(df[[col]])
+                    except ValueError as e:
+                        print(f"Error normalizando {col}: {str(e)}")
+                        continue
+        required_cols = ['arrival_date', 'deposit_type', 'is_canceled']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            print(f"Faltan columnas requeridas para el análisis: {missing_cols}")
+            return None
         return df
+
     except Exception as e:
         print(f"Error en transformación: {e}")
         return None
@@ -128,7 +182,81 @@ def train_random_forest(df):
         print(f"Error en modelado: {e}")
         return None, None, None
 
-# ============ Diseño de la aplicación simplificado ============
+def generate_column_stats(df, title):
+    """Genera gráficos de distribución para columnas numéricas"""
+    numeric_cols = df.select_dtypes(include=['number']).columns
+    if len(numeric_cols) == 0:
+        return html.Div("No hay columnas numéricas para mostrar")
+    
+    # Mostrar solo las primeras 6 columnas para no saturar
+    show_cols = numeric_cols[:6]
+    
+    fig = make_subplots(rows=2, cols=3, subplot_titles=show_cols)
+    
+    for i, col in enumerate(show_cols):
+        row = (i // 3) + 1
+        col_num = (i % 3) + 1
+        fig.add_trace(
+            go.Histogram(x=df[col], name=col),
+            row=row, col=col_num
+        )
+    
+    fig.update_layout(
+        height=600,
+        title_text=title,
+        showlegend=False
+    )
+    
+    return dcc.Graph(figure=fig)
+
+def generate_comparison_plots(original_df, transformed_df):
+    """Genera gráficos comparativos lado a lado"""
+    common_cols = list(set(original_df.columns) & set(transformed_df.columns))
+    plots = []
+    
+    for col in common_cols[:6]:  # Mostrar máximo 6 columnas
+        if original_df[col].dtype.kind in 'iufc' and transformed_df[col].dtype.kind in 'iufc':
+            # Para columnas numéricas
+            fig = make_subplots(rows=1, cols=2, subplot_titles=[f"Original - {col}", f"Transformado - {col}"])
+            
+            fig.add_trace(
+                go.Histogram(x=original_df[col], name='Original'),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Histogram(x=transformed_df[col], name='Transformado'),
+                row=1, col=2
+            )
+            
+            fig.update_layout(height=300, showlegend=False)
+            plots.append(dcc.Graph(figure=fig))
+        
+        elif original_df[col].dtype == 'object' and transformed_df[col].dtype == 'object':
+            # Para columnas categóricas
+            fig = make_subplots(rows=1, cols=2, 
+                              subplot_titles=[f"Original - {col}", f"Transformado - {col}"],
+                              specs=[[{'type':'domain'}, {'type':'domain'}]])
+            
+            orig_counts = original_df[col].value_counts().nlargest(5)
+            trans_counts = transformed_df[col].value_counts().nlargest(5)
+            
+            fig.add_trace(
+                go.Pie(labels=orig_counts.index, values=orig_counts.values, name='Original'),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Pie(labels=trans_counts.index, values=trans_counts.values, name='Transformado'),
+                row=1, col=2
+            )
+            
+            fig.update_layout(height=400, showlegend=True)
+            plots.append(dcc.Graph(figure=fig))
+    
+    return html.Div(plots)
+
+# ============ Diseño de la aplicación ============
 app.layout = dbc.Container([
     html.H1("Sistema ETL para Reservas Hoteleras", className="mb-4 text-center"),
     dbc.Tabs([
@@ -164,19 +292,120 @@ app.layout = dbc.Container([
                 dbc.Row([
                     dbc.Col([
                         html.H4("Datos Originales"),
-                        html.Div(id='original-data-table')
+                        html.Div(id='original-data-table'),
+                        html.Div(id='column-stats-before-container', className='mt-3')
                     ], width=6),
                     dbc.Col([
                         html.H4("Datos Transformados"),
                         html.Div(id='transformed-data-table'),
-                        html.Div(id='etl-summary')  # Resumen arriba
+                        html.Div(id='column-stats-after-container', className='mt-3')
                     ], width=6)
                 ]),
-                dbc.Button("Aplicar Transformación", id='transform-button', className="mt-3"),
+                
+                # Sección de controles ETL
+                dbc.Card([
+                    dbc.CardHeader("Controles de Transformación"),
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                html.H5("Operaciones de Limpieza", className="mb-3"),
+                                dcc.Checklist(
+                                    id='clean-options',
+                                    options=[
+                                        {'label': 'Rellenar valores nulos', 'value': 'fillna'},
+                                        {'label': 'Eliminar duplicados', 'value': 'drop_duplicates'},
+                                        {'label': 'Eliminar filas con >50% nulos', 'value': 'drop_na_rows'}
+                                    ],
+                                    value=['fillna', 'drop_duplicates']
+                                ),
+                                html.H5("Columnas a eliminar", className="mt-3"),
+                                dcc.Dropdown(
+                                    id='columns-to-drop',
+                                    multi=True,
+                                    placeholder="Selecciona columnas..."
+                                )
+                            ], width=4),
+                            
+                            dbc.Col([
+                                html.H5("Transformaciones Numéricas", className="mb-3"),
+                                dcc.Dropdown(
+                                    id='numeric-columns',
+                                    multi=True,
+                                    placeholder="Selecciona columnas numéricas..."
+                                ),
+                                dbc.RadioItems(
+                                    id='numeric-transformation',
+                                    options=[
+                                        {'label': 'Normalizar (MinMax)', 'value': 'minmax'},
+                                        {'label': 'Estandarizar (Z-score)', 'value': 'standard'},
+                                        {'label': 'Logaritmo', 'value': 'log'}
+                                    ],
+                                    value='minmax',
+                                    className="mt-2"
+                                ),
+                                dbc.Button("Aplicar a selección", 
+                                         id='apply-numeric-transform',
+                                         color="primary",
+                                         className="mt-2")
+                            ], width=4),
+                            
+                            dbc.Col([
+                                html.H5("Transformaciones de Texto", className="mb-3"),
+                                dcc.Dropdown(
+                                    id='text-columns',
+                                    multi=True,
+                                    placeholder="Selecciona columnas de texto..."
+                                ),
+                                dbc.RadioItems(
+                                    id='text-transformation',
+                                    options=[
+                                        {'label': 'Codificar (LabelEncoder)', 'value': 'label_encode'},
+                                        {'label': 'One-Hot Encoding', 'value': 'onehot'},
+                                        {'label': 'Extraer características', 'value': 'extract'}
+                                    ],
+                                    value='label_encode',
+                                    className="mt-2"
+                                ),
+                                dbc.Button("Aplicar a selección", 
+                                         id='apply-text-transform',
+                                         color="primary",
+                                         className="mt-2")
+                            ], width=4)
+                        ]),
+                        
+                        # Botón para aplicar todas las transformaciones
+                        dbc.Row([
+                            dbc.Col(
+                                dbc.Button("Aplicar Todas las Transformaciones", 
+                                         id='apply-all-transforms',
+                                         color="success",
+                                         className="mt-3 w-100"),
+                                width=12
+                            )
+                        ])
+                    ])
+                ], className='mt-3'),
+                
+                # Sección de visualización de cambios
+                dbc.Card([
+                    dbc.CardHeader("Detalle de Cambios"),
+                    dbc.CardBody([
+                        dcc.Graph(id='changes-heatmap'),
+                        html.Div(id='changes-summary-table', className='mt-3')
+                    ])
+                ], className='mt-3'),
+                
+                # Comparación detallada
+                dbc.Card([
+                    dbc.CardHeader("Comparación Detallada Columna por Columna"),
+                    dbc.CardBody([
+                        html.Div(id='detailed-comparison')
+                    ])
+                ], className='mt-3')
             ], className='mt-4')
         ], label="ETL"),
         
-    # Pestaña 3: Minería de Datos
+        # Pestaña 3: Minería de Datos
         dbc.Tab([
             html.Div([
                 dbc.Row([
@@ -231,6 +460,7 @@ app.layout = dbc.Container([
                 ])
             ], className='mt-4')
         ], label="Minería de Datos"),
+        
         # Pestaña 4: Toma de Decisiones
         dbc.Tab([
             html.Div([
@@ -260,7 +490,14 @@ app.layout = dbc.Container([
                         html.H4("Recomendaciones"),
                         html.Div(id='recommendations')
                     ], width=12)
-                ])
+                ]),
+                dbc.Row([
+                    dbc.Col(
+                        dbc.Button("Exportar Reporte", id='export-report', className="mt-3"),
+                        width=12
+                    )
+                ]),
+                dcc.Download(id="download-report")
             ], className='mt-4')
         ], label="Toma de Decisión")
     ])
@@ -272,32 +509,57 @@ app.layout = dbc.Container([
 @app.callback(
     [Output('output-data-upload', 'children'),
      Output('data-preview-container', 'children'),
-     Output('original-data-table', 'children')],
+     Output('original-data-table', 'children'),
+     Output('columns-to-drop', 'options'),
+     Output('numeric-columns', 'options'),
+     Output('text-columns', 'options')],
     [Input('upload-data', 'contents')],
-    [State('upload-data', 'filename')]
+    [State('upload-data', 'filename'),
+     State('upload-data', 'last_modified')]
 )
-def update_output(contents, filename):
+def update_output(contents, filename, last_modified):
     if contents is None:
-        return [html.Div("No se ha cargado ningún archivo."), None, None]
+        return [html.Div("No se ha cargado ningún archivo."), None, None, [], [], []]
     
     content_type, content_string = contents.split(',')
     decoded = base64.b64decode(content_string)
     
     try:
         if 'csv' in filename:
-            df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
+            # Intentar diferentes codificaciones
+            try:
+                df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
+            except:
+                df = pd.read_csv(io.StringIO(decoded.decode('latin-1')))
         elif 'xls' in filename:
             df = pd.read_excel(io.BytesIO(decoded))
         elif 'json' in filename:
-            df = pd.read_json(io.StringIO(decoded.decode('utf-8')))
+            # Manejar diferentes formatos JSON
+            try:
+                df = pd.read_json(io.StringIO(decoded.decode('utf-8')))
+            except:
+                df = pd.json_normalize(json.loads(decoded))
         else:
-            return [html.Div("Formato de archivo no soportado"), None, None]
+            return [html.Div("Formato de archivo no soportado"), None, None, [], [], []]
+        
+        # Validar que el dataframe no esté vacío
+        if df.empty:
+            return [html.Div("El archivo está vacío"), None, None, [], [], []]
+            
     except Exception as e:
-        return [html.Div(f"Error al cargar el archivo: {str(e)}"), None, None]
+        return [html.Div([
+            html.P("Error al cargar el archivo"),
+            html.P(str(e), style={'color': 'red'})
+        ]), None, None, [], [], []]
     
-    global original_df
+    global original_df, decision_df
     original_df = df.copy()
-    
+
+    # Limpiar y transformar solo para toma de decisiones
+    df_decision = clean_data(df.copy())
+    df_decision = transform_data(df_decision)
+    decision_df = df_decision.copy() if df_decision is not None else None
+
     # Información básica
     file_info = html.Div([
         html.H5(filename),
@@ -338,76 +600,367 @@ def update_output(contents, filename):
         preview_table
     ])
     
-    return [file_info, preview_content, original_table]
+    # Definir columnas protegidas
+    protected_columns = [
+        'lead_time', 
+        'arrival_date', 
+        'hotel', 
+        'adr', 
+        'total_nights', 
+        'is_canceled',
+        'stays_in_week_nights',
+        'stays_in_weekend_nights'
+    ]
+    
+    # Filtrar columnas disponibles excluyendo las protegidas
+    available_columns = [col for col in df.columns if col not in protected_columns]
+    
+    # Opciones para los dropdowns de columnas
+    columns = [{'label': col, 'value': col} for col in available_columns]
+    
+    # Columnas numéricas (excluyendo protegidas)
+    numeric_cols = [
+        {'label': col, 'value': col} 
+        for col in df.select_dtypes(include=['number']).columns
+        if col not in protected_columns
+    ]
+    
+    # Columnas de texto (excluyendo protegidas)
+    text_cols = [
+        {'label': col, 'value': col} 
+        for col in df.select_dtypes(include=['object']).columns
+        if col not in protected_columns
+    ]
+    
+    return [file_info, preview_content, original_table, columns, numeric_cols, text_cols]
 
-# Callback unificado para transformación de datos
+# Callback para aplicar transformaciones
 @app.callback(
     [Output('transformed-data-table', 'children'),
-     Output('etl-summary', 'children'),
-     Output('eda-plot', 'figure', allow_duplicate=True)],
-    [Input('transform-button', 'n_clicks')],
-    [State('original-data-table', 'children')],
+     Output('changes-heatmap', 'figure'),
+     Output('changes-summary-table', 'children'),
+     Output('column-stats-before-container', 'children'),
+     Output('column-stats-after-container', 'children'),
+     Output('detailed-comparison', 'children')],
+    [Input('apply-all-transforms', 'n_clicks'),
+     Input('apply-numeric-transform', 'n_clicks'),
+     Input('apply-text-transform', 'n_clicks')],
+    [State('clean-options', 'value'),
+     State('columns-to-drop', 'value'),
+     State('numeric-columns', 'value'),
+     State('numeric-transformation', 'value'),
+     State('text-columns', 'value'),
+     State('text-transformation', 'value')],
     prevent_initial_call=True
 )
-def transform_data_callback(n_clicks, _):
-    if n_clicks is None or 'original_df' not in globals():
-        return None, "", px.scatter(title="Datos no cargados")
+def apply_transformations(all_clicks, num_clicks, text_clicks, 
+                        clean_opts, drop_cols, num_cols, num_trans, 
+                        text_cols, text_trans):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
     
-    try:
-        df = original_df.copy()
-        df_cleaned = clean_data(df)
-        if df_cleaned is None:
-            raise ValueError("Error en la limpieza de datos")
+    if 'original_df' not in globals():
+        return None, go.Figure(), html.Div(), None, None, None
+    
+    df = original_df.copy()
+    changes_log = []
+    
+    # Lista de columnas protegidas que no se pueden eliminar
+    protected_columns = ['lead_time', 'arrival_date', 'hotel', 'adr', 'total_nights', 'is_canceled']
+    
+    # Inicializar listas de columnas seguras
+    text_cols_list = list(text_cols) if text_cols is not None else []
+    num_cols_list = list(num_cols) if num_cols is not None else []
+    
+    # Aplicar limpieza básica
+    if clean_opts and 'fillna' in clean_opts:
+        null_counts_before = df.isnull().sum().sum()
+        
+        numeric_cols = df.select_dtypes(include=['number']).columns
+        for col in numeric_cols:
+            df[col].fillna(df[col].median(), inplace=True)
+        
+        text_cols = df.select_dtypes(include=['object']).columns
+        for col in text_cols:
+            df[col].fillna('Unknown', inplace=True)
+        
+        null_counts_after = df.isnull().sum().sum()
+        if null_counts_before != null_counts_after:
+            changes_log.append({
+                'Operación': 'Rellenar nulos',
+                'Detalle': f'Se rellenaron {null_counts_before - null_counts_after} valores nulos',
+                'Columnas': ', '.join(numeric_cols.union(text_cols))
+            })
+    
+    if clean_opts and 'drop_duplicates' in clean_opts:
+        before = len(df)
+        df.drop_duplicates(inplace=True)
+        after = len(df)
+        if before != after:
+            changes_log.append({
+                'Operación': 'Eliminar duplicados',
+                'Detalle': f'Se eliminaron {before - after} filas duplicadas',
+                'Columnas': 'Todas'
+            })
+    
+    if clean_opts and 'drop_na_rows' in clean_opts:
+        before = len(df)
+        threshold = len(df.columns) // 2
+        df.dropna(thresh=threshold, inplace=True)
+        after = len(df)
+        if before != after:
+            changes_log.append({
+                'Operación': 'Eliminar filas con nulos',
+                'Detalle': f'Se eliminaron {before - after} filas con >50% nulos',
+                'Columnas': 'Todas'
+            })
+    
+    # Eliminar columnas seleccionadas (excluyendo las protegidas)
+    if drop_cols:
+        # Filtrar para excluir columnas protegidas
+        drop_cols = [col for col in drop_cols if col not in protected_columns]
+        
+        before_cols = set(df.columns)
+        df.drop(columns=[col for col in drop_cols if col in df.columns], inplace=True)
+        after_cols = set(df.columns)
+        dropped = before_cols - after_cols
+        if dropped:
+            changes_log.append({
+                'Operación': 'Eliminar columnas',
+                'Detalle': f'Se eliminaron {len(dropped)} columnas',
+                'Columnas': ', '.join(dropped)
+            })
+    
+    # Aplicar transformaciones numéricas (con protección para columnas críticas)
+    if num_cols_list and num_trans and ctx.triggered[0]['prop_id'] in ('apply-numeric-transform.n_clicks', 'apply-all-transforms.n_clicks'):
+        for col in num_cols_list:
+            if col in df.columns and col not in protected_columns:  # Solo aplicar a columnas no protegidas
+                original_values = df[col].copy()
+                
+                if num_trans == 'minmax':
+                    scaler = MinMaxScaler()
+                    df[col] = scaler.fit_transform(df[[col]])
+                    trans_name = 'Normalización MinMax'
+                elif num_trans == 'standard':
+                    scaler = StandardScaler()
+                    df[col] = scaler.fit_transform(df[[col]])
+                    trans_name = 'Estandarización Z-score'
+                elif num_trans == 'log':
+                    df[col] = np.log1p(df[col])
+                    trans_name = 'Transformación Logarítmica'
+                
+                if not np.allclose(original_values, df[col], equal_nan=True):
+                    changes_log.append({
+                        'Operación': trans_name,
+                        'Detalle': f'Aplicado a {col}',
+                        'Columnas': col
+                    })
+    
+    # Aplicar transformaciones de texto (con protección para columnas críticas)
+    if text_cols_list and text_trans and ctx.triggered[0]['prop_id'] in ('apply-text-transform.n_clicks', 'apply-all-transforms.n_clicks'):
+        for col in text_cols_list:
+            if col in df.columns and col not in protected_columns:  # Solo aplicar a columnas no protegidas
+                if text_trans == 'label_encode':
+                    le = LabelEncoder()
+                    df[col] = le.fit_transform(df[col].astype(str))
+                    trans_name = 'Codificación Label'
+                elif text_trans == 'onehot':
+                    dummies = pd.get_dummies(df[col], prefix=col)
+                    df.drop(columns=[col], inplace=True)
+                    df = pd.concat([df, dummies], axis=1)
+                    trans_name = 'One-Hot Encoding'
+                elif text_trans == 'extract':
+                    df[f'{col}_length'] = df[col].str.len()
+                    trans_name = 'Extracción de características'
+                
+                changes_log.append({
+                    'Operación': trans_name,
+                    'Detalle': f'Aplicado a {col}',
+                    'Columnas': col
+                })
+    
+    # Crear columna total_nights si no existe (protegida)
+    if 'total_nights' not in df.columns and all(col in df.columns for col in ['stays_in_weekend_nights', 'stays_in_week_nights']):
+        df['total_nights'] = df['stays_in_week_nights'] + df['stays_in_weekend_nights']
+        changes_log.append({
+            'Operación': 'Crear columna',
+            'Detalle': 'Se creó total_nights como suma de stays_in_week_nights y stays_in_weekend_nights',
+            'Columnas': 'total_nights'
+        })
+    
+    # Actualizar el dataframe transformado global
+    global transformed_df
+    transformed_df = df.copy()
+    
+    # Generar tabla de datos transformados
+    table = dash_table.DataTable(
+        data=df.head(10).to_dict('records'),
+        columns=[{'name': i, 'id': i} for i in df.columns],
+        page_size=10,
+        style_table={'overflowX': 'auto'}
+    )
+
+    # Generar heatmap de cambios
+    if 'original_df' in globals() and not original_df.empty and not df.empty:
+        common_cols = list(set(original_df.columns) & set(df.columns))
+        if common_cols:
+            change_data = []
+            for col in common_cols:
+                if original_df[col].dtype.kind in 'iufc' and df[col].dtype.kind in 'iufc':
+                    diff = np.mean(np.abs(original_df[col] - df[col])) / (original_df[col].max() - original_df[col].min() + 1e-10)
+                    change_data.append(diff)
+                else:
+                    changed = not original_df[col].equals(df[col])
+                    change_data.append(1 if changed else 0)
             
-        df_transformed = transform_data(df_cleaned)
-        if df_transformed is None:
-            raise ValueError("Error en la transformación de datos")
-        
-        global transformed_df
-        transformed_df = df_transformed.copy()
-        
-        # 1. Tabla de datos transformados
-        table = dash_table.DataTable(
-            data=df_transformed.head(10).to_dict('records'),
-            columns=[{'name': i, 'id': i} for i in df_transformed.columns],
-            page_size=10,
+            heatmap_fig = px.imshow(
+                [change_data],
+                x=common_cols,
+                labels=dict(x="Columna", y="", color="Cambio"),
+                color_continuous_scale='Viridis',
+                aspect="auto"
+            )
+            heatmap_fig.update_layout(title='Mapa de Calor de Cambios por Columna')
+        else:
+            heatmap_fig = go.Figure()
+            heatmap_fig.update_layout(
+                title='No hay columnas comunes para comparar',
+                annotations=[dict(text="No se pueden comparar los datos", showarrow=False)]
+            )
+    else:
+        heatmap_fig = go.Figure()
+    
+    # Tabla resumen de cambios
+    if changes_log:
+        changes_table = dash_table.DataTable(
+            columns=[{'name': col, 'id': col} for col in ['Operación', 'Detalle', 'Columnas']],
+            data=changes_log,
             style_table={'overflowX': 'auto'}
         )
-        
-        # 2. Resumen ETL
-        df_orig = original_df
-        stats = html.Div([
-            html.H5("Resumen de Transformación"),
-            html.P(f"Filas originales: {df_orig.shape[0]}, columnas originales: {df_orig.shape[1]}"),
-            html.P(f"Filas transformadas: {df_transformed.shape[0]}, columnas transformadas: {df_transformed.shape[1]}")
-        ])
+    else:
+        changes_table = html.Div("No se aplicaron transformaciones", className='text-muted')
+    
+    # Gráficos de distribución antes/después
+    stats_before = generate_column_stats(original_df, "Distribución Original")
+    stats_after = generate_column_stats(df, "Distribución Transformada")
+    
+    # Comparación detallada
+    comparison = generate_comparison_plots(original_df, df)
+    
+    return table, heatmap_fig, changes_table, stats_before, stats_after, comparison
 
-        # Comparación de columnas
-        orig_cols = set(df_orig.columns)
-        trans_cols = set(df_transformed.columns)
-        added = trans_cols - orig_cols
-        removed = orig_cols - trans_cols
-
-        comparison = html.Div([
-            html.P("Nuevas columnas creadas:"),
-            html.Ul([html.Li(col) for col in added] if added else [html.Li("Ninguna")]),
-            html.P("Columnas eliminadas:"),
-            html.Ul([html.Li(col) for col in removed] if removed else [html.Li("Ninguna")])
-        ])
-
-        summary = html.Div([stats, comparison])
-        
-        # 3. Gráfico EDA inicial
-        eda_fig = px.histogram(df_transformed, x='hotel', title='Distribución de Hoteles (Post-Transformación)')
-        
-        return table, summary, eda_fig
-        
+# Callback para exportar reporte
+@app.callback(
+    Output("download-report", "data"),
+    [Input("export-report", "n_clicks")],
+    prevent_initial_call=True
+)
+def export_report(n_clicks):
+    if n_clicks is None or 'transformed_df' not in globals():
+        return None
+    
+    df = transformed_df.copy()
+    
+    # Crear archivo Excel en memoria
+    output = io.BytesIO()
+    
+    try:
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            # 1. HOJA: DATOS COMPLETOS
+            df.to_excel(writer, sheet_name='Datos Completos', index=False)
+            
+            # 2. HOJA: RESUMEN EJECUTIVO
+            summary_data = {
+                'Métrica': ['Total Reservas', 
+                           'Tasa Cancelación' if 'is_canceled' in df.columns else None,
+                           'ADR Promedio',
+                           'Lead Time Promedio',
+                           'Estancia Promedio'],
+                'Valor': [
+                    len(df),
+                    df['is_canceled'].mean() if 'is_canceled' in df.columns else None,
+                    df['adr'].mean() if 'adr' in df.columns else None,
+                    df['lead_time'].mean() if 'lead_time' in df.columns else None,
+                    df['total_nights'].mean() if 'total_nights' in df.columns else None
+                ]
+            }
+            # Eliminar métricas no disponibles
+            summary_data = {k: [v for v in vals if v is not None] 
+                          for k, vals in summary_data.items() if any(vals)}
+            
+            pd.DataFrame(summary_data).to_excel(
+                writer, 
+                sheet_name='Resumen Ejecutivo', 
+                index=False
+            )
+            
+            # 3. HOJA: ANÁLISIS ESTADÍSTICO
+            stats = df.describe(include='all').round(2)
+            stats.to_excel(writer, sheet_name='Estadísticas')
+            
+            # 4. HOJA: CANCELACIONES
+            if 'is_canceled' in df.columns:
+                # Análisis básico
+                cancel_data = df.groupby('is_canceled').size().to_frame('Count')
+                
+                # Análisis por segmentos
+                cancel_by_segment = pd.DataFrame()
+                if 'hotel' in df.columns:
+                    cancel_by_segment['Por Hotel'] = df.groupby('hotel')['is_canceled'].mean()
+                if 'arrival_date' in df.columns:
+                    df['month'] = df['arrival_date'].dt.month
+                    cancel_by_segment['Por Mes'] = df.groupby('month')['is_canceled'].mean()
+                if 'market_segment' in df.columns:
+                    cancel_by_segment['Por Segmento'] = df.groupby('market_segment')['is_canceled'].mean()
+                
+                # Exportar análisis
+                cancel_data.to_excel(writer, sheet_name='Cancelaciones')
+                if not cancel_by_segment.empty:
+                    cancel_by_segment.to_excel(writer, sheet_name='Cancelaciones', startrow=len(cancel_data)+3)
+            
+            # 5. HOJA: ANÁLISIS ADICIONAL
+            if 'adr' in df.columns and 'total_nights' in df.columns:
+                revenue_analysis = df.assign(
+                    estimated_revenue=lambda x: x['adr'] * x['total_nights']
+                ).groupby('hotel').agg({
+                    'estimated_revenue': 'sum',
+                    'adr': 'mean',
+                    'total_nights': 'mean'
+                })
+                revenue_analysis.to_excel(writer, sheet_name='Ingresos')
+            
+            # profesional
+            workbook = writer.book
+            header_format = workbook.add_format({
+                'bold': True,
+                'text_wrap': True,
+                'valign': 'top',
+                'fg_color': '#4472C4',
+                'font_color': 'white',
+                'border': 1
+            })
+            
+            for sheet in writer.sheets:
+                worksheet = writer.sheets[sheet]
+                worksheet.freeze_panes(1, 0)  # Congelar encabezados
+                worksheet.autofilter(0, 0, 0, df.shape[1]-1)  # Filtros
+                
+                # Formato de columnas según tipo de dato
+                if sheet == 'Resumen Ejecutivo':
+                    worksheet.set_column('B:B', 15, workbook.add_format({'num_format': '#,##0.00'}))
+                
+                # Aplicar formato a encabezados
+                for col_num, value in enumerate(df.columns.values if sheet == 'Datos Completos' else []):
+                    worksheet.write(0, col_num, value, header_format)
+    
     except Exception as e:
-        error_msg = html.Div([
-            html.P(f"Error: {str(e)}", style={'color': 'red'}),
-            html.P("Verifica que tus datos tengan las columnas esperadas.")
-        ])
-        return error_msg, html.Div(), px.scatter(title=f"Error: {str(e)}")
+        print(f"Error generando reporte: {e}")
+        return None
+    
+    output.seek(0)
+    timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M')
+    return dcc.send_bytes(output.getvalue(), filename=f"Reporte_Hoteles_{timestamp}.xlsx")
 
 # Callback para gráficos EDA
 @app.callback(
@@ -427,15 +980,27 @@ def update_eda_plot(plot_type):
         fig = px.histogram(df, x='adr', 
                           title='Distribución de ADR (Tarifa Diaria Promedio)')
     elif plot_type == 'country':
-        top_countries = df['country'].value_counts().head(15)
-        fig = px.bar(top_countries, 
-                    title='Top 15 Países de Origen de los Clientes')
-    elif plot_type == 'cancel_lead':
+        if 'country' in df.columns:
+            top_countries = df['country'].value_counts().head(15)
+            fig = px.bar(top_countries, 
+                        title='Top 15 Países de Origen de los Clientes',
+                        labels={'value': 'Número de Reservas', 'index': 'País'})
+        else:
+            fig = px.scatter(title="Datos de país no disponibles")
+            fig.add_annotation(text="La columna 'country' no está disponible en los datos",
+                             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+    
+    elif plot_type == 'cancel_lead' and all(col in df.columns for col in ['is_canceled', 'lead_time']):
         fig = px.box(df, x='is_canceled', y='lead_time',
-                    title='Relación entre Lead Time y Cancelaciones')
+                    title='Relación entre Lead Time y Cancelaciones',
+                    labels={'is_canceled': 'Cancelado', 'lead_time': 'Días de Anticipación'})
+    
+    else:
+        fig = px.scatter(title="Datos no disponibles para este gráfico")
     
     return fig
-# Callback para el clustering - Versión corregida
+
+# Callback para el clustering
 @app.callback(
     [Output('cluster-plot', 'figure'),
      Output('cluster-summary', 'children')],
@@ -444,35 +1009,73 @@ def update_eda_plot(plot_type):
     prevent_initial_call=True
 )
 def apply_clustering(n_clicks, feature_pair):
+    # Verificación inicial
     if n_clicks is None or 'transformed_df' not in globals():
         return go.Figure(), "Presiona el botón para aplicar clustering"
     
-    df = transformed_df
+    df = transformed_df.copy()
     
     try:
-        # Seleccionar características según la opción elegida
-        if feature_pair == 'lt_adr':
-            features = df[['lead_time', 'adr']].dropna()
-            x_col, y_col = 'lead_time', 'adr'
-        elif feature_pair == 'nights_adr':
-            features = df[['total_nights', 'adr']].dropna()
-            x_col, y_col = 'total_nights', 'adr'
-        else:  # lt_nights
-            features = df[['lead_time', 'total_nights']].dropna()
-            x_col, y_col = 'lead_time', 'total_nights'
+        # 1. Verificación y creación de total_nights
+        if 'total_nights' not in df.columns:
+            night_cols = ['stays_in_week_nights', 'stays_in_weekend_nights']
+            if all(col in df.columns for col in night_cols):
+                # Asegurar que sean numéricas y manejar nulos
+                df[night_cols] = df[night_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+                df['total_nights'] = df['stays_in_week_nights'] + df['stays_in_weekend_nights']
         
-        # Normalizar
+        # 2. Selección de características con validación completa
+        feature_mapping = {
+            'lt_adr': {
+                'required': ['lead_time', 'adr'],
+                'x': 'lead_time',
+                'y': 'adr'
+            },
+            'nights_adr': {
+                'required': ['total_nights', 'adr'],
+                'x': 'total_nights',
+                'y': 'adr'
+            },
+            'lt_nights': {
+                'required': ['lead_time', 'total_nights'],
+                'x': 'lead_time',
+                'y': 'total_nights'
+            }
+        }
+        
+        if feature_pair not in feature_mapping:
+            raise ValueError(f"Opción de clustering no válida: {feature_pair}")
+        
+        config = feature_mapping[feature_pair]
+        missing_cols = [col for col in config['required'] if col not in df.columns]
+        
+        if missing_cols:
+            raise ValueError(f"Faltan columnas requeridas: {', '.join(missing_cols)}. Columnas disponibles: {', '.join(df.columns)}")
+        
+        features = df[config['required']].dropna()
+        if len(features) == 0:
+            raise ValueError("No hay datos válidos para clustering después de eliminar nulos")
+        
+        x_col, y_col = config['x'], config['y']
+        
+        # 3. Normalización con verificación
         scaler = MinMaxScaler()
-        features_scaled = scaler.fit_transform(features)
-        
-        # Aplicar K-Means
-        kmeans = KMeans(n_clusters=3, random_state=42)
-        clusters = kmeans.fit_predict(features_scaled)
-        
-        # Crear gráfico - Usando go.Figure en lugar de px.scatter
+        try:
+            features_scaled = scaler.fit_transform(features)
+        except ValueError as e:
+            raise ValueError(f"Error al normalizar datos: {str(e)}. Valores mínimos/máximos: {features.min()}/{features.max()}")
+
+        # 4. Aplicar K-Means con configuración adaptable
+        try:
+            kmeans = KMeans(n_clusters=3, random_state=42)
+            clusters = kmeans.fit_predict(features_scaled)
+        except Exception as e:
+            raise ValueError(f"Error en clustering: {str(e)}")
+
+        # 5. Creación del gráfico con más información
         fig = go.Figure()
+        colors = ['#636EFA', '#EF553B', '#00CC96'] 
         
-        # Añadir cada cluster como una traza separada
         for cluster_id in range(3):
             cluster_data = features[clusters == cluster_id]
             fig.add_trace(go.Scatter(
@@ -482,56 +1085,88 @@ def apply_clustering(n_clicks, feature_pair):
                 name=f'Cluster {cluster_id}',
                 marker=dict(
                     size=8,
-                    opacity=0.7
-                )
+                    opacity=0.7,
+                    color=colors[cluster_id]
+                ),
+                hovertemplate=f"{x_col}: %{{x}}<br>{y_col}: %{{y}}<extra></extra>"
             ))
         
         fig.update_layout(
             title=f'Clustering de {x_col.replace("_", " ")} vs {y_col.replace("_", " ")}',
             xaxis_title=x_col.replace("_", " ").title(),
             yaxis_title=y_col.replace("_", " ").title(),
-            legend_title='Clusters'
+            legend_title='Clusters',
+            hovermode='closest'
         )
         
-        # Resumen de clusters
+        # 6. Resumen estadístico mejorado
         features['cluster'] = clusters
         cluster_stats = features.groupby('cluster').agg({
-            x_col: ['mean', 'median', 'count'],
-            y_col: ['mean', 'median']
+            x_col: ['mean', 'median', 'std', 'count'],
+            y_col: ['mean', 'median', 'std']
         }).reset_index()
         
-        # Renombrar columnas para mejor visualización
+        # Formatear nombres de columnas
         cluster_stats.columns = ['_'.join(col).strip('_') for col in cluster_stats.columns.values]
         
+        # Interpretación automática de clusters
+        interpretations = []
+        for cluster_id in range(3):
+            x_mean = cluster_stats.loc[cluster_id, f'{x_col}_mean']
+            y_mean = cluster_stats.loc[cluster_id, f'{y_col}_mean']
+            
+            x_level = "bajos" if x_mean < features[x_col].quantile(0.33) else "medios" if x_mean < features[x_col].quantile(0.66) else "altos"
+            y_level = "bajos" if y_mean < features[y_col].quantile(0.33) else "medios" if y_mean < features[y_col].quantile(0.66) else "altos"
+            
+            interpretations.append(f"Cluster {cluster_id}: Valores {x_level} en {x_col.replace('_', ' ')} y {y_level} en {y_col.replace('_', ' ')}")
+        
         summary = html.Div([
-            html.H5("Resumen de Clusters:"),
+            html.H5("Resumen de Clusters:", className="mb-3"),
             dash_table.DataTable(
                 columns=[{"name": col.replace("_", " ").title(), "id": col} 
                          for col in cluster_stats.columns],
                 data=cluster_stats.to_dict('records'),
                 style_table={'overflowX': 'auto'},
-                style_cell={'textAlign': 'left'},
-                page_size=10
+                style_cell={
+                    'textAlign': 'left',
+                    'padding': '10px'
+                },
+                page_size=10,
+                style_header={
+                    'backgroundColor': 'rgb(230, 230, 230)',
+                    'fontWeight': 'bold'
+                }
             ),
-            html.P("Interpretación de clusters:", className="mt-3"),
-            html.Ul([
-                html.Li("Cluster 0: Valores bajos en ambas dimensiones"),
-                html.Li("Cluster 1: Valores medios"),
-                html.Li("Cluster 2: Valores altos")
-            ])
+            html.Hr(),
+            html.H5("Interpretación de clusters:", className="mt-3"),
+            html.Ul([html.Li(interpretation) for interpretation in interpretations])
         ])
         
         return fig, summary
         
     except Exception as e:
+        error_msg = str(e)
         error_fig = go.Figure()
         error_fig.update_layout(
-            title=f"Error: {str(e)}",
-            annotations=[dict(text="Ocurrió un error al procesar los datos",
-                             xref="paper", yref="paper",
-                             showarrow=False)]
+            title="Error en clustering",
+            annotations=[dict(
+                text=error_msg,
+                xref="paper", yref="paper",
+                x=0.5, y=0.5,
+                showarrow=False,
+                font=dict(size=14)
+            )]
         )
-        return error_fig, html.Div(f"Error: {str(e)}", style={'color': 'red'})
+        
+        error_div = html.Div([
+            html.H5("Error en clustering:", style={'color': 'red'}),
+            html.P(error_msg),
+            html.P("Columnas disponibles en los datos:"),
+            html.Ul([html.Li(col) for col in df.columns.tolist()])
+        ])
+        
+        return error_fig, error_div
+
 # Callback para entrenar modelo y mostrar resultados
 @app.callback(
     [Output('model-metrics', 'children'),
@@ -613,11 +1248,18 @@ def update_decision_components(plot_type):
     if 'transformed_df' not in globals() or 'original_df' not in globals():
         return [px.scatter(title="Carga y transforma los datos primero"), None, None]
     
-    df = transformed_df
+    df = decision_df
     df_orig = original_df
-
-    # KPIs: usar valores originales para lead_time y adr
-    cancelation_rate = df['is_canceled'].mean() * 100
+    # Verificación adicional de la columna arrival_date
+    if 'arrival_date' not in df.columns:
+        print("Columnas disponibles en transformed_df:", df.columns.tolist())
+        if all(col in df.columns for col in ['arrival_date_year', 'arrival_date_month', 'arrival_date_day_of_month']):
+            print("Columnas de fecha presentes pero arrival_date no creada")
+        else:
+            print("Faltan columnas necesarias para crear arrival_date")
+            
+    # KPIs (como ya los tenías)
+    cancelation_rate = df['is_canceled'].mean() * 100 if 'is_canceled' in df.columns else 0
     avg_adr = df_orig['adr'].mean() if 'adr' in df_orig.columns else 0
     avg_lead_time = df_orig['lead_time'].mean() if 'lead_time' in df_orig.columns else 0
 
@@ -636,41 +1278,77 @@ def update_decision_components(plot_type):
         ], color="warning", inverse=True), width=4)
     ], className="mb-4")
     
-    # Gráficos
+    # Gráficos con manejo robusto de datos faltantes
     if plot_type == 'season':
-        # Agrupar por mes para ver estacionalidad
         if 'arrival_date' in df.columns:
-            df['arrival_month'] = pd.to_datetime(df['arrival_date']).dt.month
-            monthly_cancel = df.groupby('arrival_month')['is_canceled'].mean().reset_index()
-            fig = px.line(monthly_cancel, x='arrival_month', y='is_canceled',
-                         title="Tasa de Cancelación por Mes")
-            fig.update_yaxes(tickformat=".0%")
-        else:
-            fig = px.scatter(title="No hay datos de fecha para análisis estacional")
+            # Extraer mes y año de la fecha
+            df['arrival_month'] = df['arrival_date'].dt.month
+            df['arrival_year'] = df['arrival_date'].dt.year
             
-    elif plot_type == 'adr_impact':
+            # Calcular cancelaciones por mes
+            monthly_data = df.groupby(['arrival_year', 'arrival_month'])['is_canceled'].mean().reset_index()
+            monthly_data['period'] = monthly_data['arrival_year'].astype(str) + '-' + monthly_data['arrival_month'].astype(str).str.zfill(2)
+            
+            fig = px.line(monthly_data, x='period', y='is_canceled',
+                         title="Tasa de Cancelación por Mes",
+                         labels={'period': 'Periodo', 'is_canceled': 'Tasa de Cancelación'})
+            fig.update_yaxes(tickformat=".0%")
+            fig.update_layout(xaxis_tickangle=-45)
+        else:
+            # Mensaje detallado sobre qué columnas faltan
+            missing_cols = []
+            for col in ['arrival_date_year', 'arrival_date_month', 'arrival_date_day_of_month']:
+                if col not in df.columns:
+                    missing_cols.append(col)
+            
+            fig = px.scatter(title="Datos de fecha no disponibles")
+            error_msg = "No se puede realizar el análisis estacional porque:"
+            if missing_cols:
+                error_msg += f"\nFaltan columnas: {', '.join(missing_cols)}"
+            else:
+                error_msg += "\nLa columna arrival_date no se pudo crear (verifica los valores de fecha)"
+            fig.add_annotation(text=error_msg,
+                            xref="paper", yref="paper",
+                            x=0.5, y=0.5, showarrow=False)
+            
+    elif plot_type == 'adr_impact' and 'adr' in df.columns and 'is_canceled' in df.columns:
         fig = px.box(df, x='is_canceled', y='adr',
-                    title="Distribución de ADR por Estado de Reserva")
+                    title="Distribución de ADR por Estado de Reserva",
+                    labels={'is_canceled': 'Cancelación', 'adr': 'ADR'})
         
-    elif plot_type == 'deposit' and 'deposit_type' in df.columns:
+    elif plot_type == 'deposit' and 'deposit_type' in df.columns and 'is_canceled' in df.columns:
         deposit_cancel = df.groupby('deposit_type')['is_canceled'].mean().reset_index()
         fig = px.bar(deposit_cancel, x='deposit_type', y='is_canceled',
-                    title="Tasa de Cancelación por Tipo de Depósito")
+                    title="Tasa de Cancelación por Tipo de Depósito",
+                    labels={'deposit_type': 'Tipo de Depósito', 'is_canceled': 'Tasa de Cancelación'})
         fig.update_yaxes(tickformat=".0%")
     else:
         fig = px.scatter(title="Datos no disponibles para este gráfico")
+        fig.add_annotation(text="Las columnas requeridas para este análisis no están disponibles",
+                          xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
     
-    # Recomendaciones basadas en análisis
-    recommendations = html.Div([
+    # Recomendaciones basadas en análisis disponible
+    recommendations = []
+    
+    if 'arrival_date' in df.columns and 'is_canceled' in df.columns:
+        # Análisis estacional
+        monthly_cancel = df.groupby(df['arrival_date'].dt.month)['is_canceled'].mean()
+        worst_month = monthly_cancel.idxmax()
+        recommendations.append(f"Atención especial en el mes {worst_month} (tasa de cancelación más alta)")
+    
+    if 'lead_time' in df.columns and 'is_canceled' in df.columns:
+        # Análisis de lead time
+        recommendations.append("Ofrecer descuentos para reservas con alto lead time (mayor probabilidad de cancelación)")
+    
+    if not recommendations:
+        recommendations.append("Carga más datos o realiza transformaciones para obtener recomendaciones")
+    
+    recommendations_html = html.Div([
         html.H5("Recomendaciones:"),
-        html.Ul([
-            html.Li("Ofrecer descuentos o beneficios para reservas con alto lead time para reducir cancelaciones"),
-            html.Li("Revisar política de depósitos, ya que ciertos tipos tienen mayor tasa de cancelación"),
-            html.Li("Ajustar precios (ADR) en temporadas con alta cancelación")
-        ])
+        html.Ul([html.Li(item) for item in recommendations])
     ])
     
-    return [fig, kpi_cards, recommendations]
+    return [fig, kpi_cards, recommendations_html]
 
 # Ejecutar la aplicación
 if __name__ == '__main__':
