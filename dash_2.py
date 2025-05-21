@@ -25,8 +25,7 @@ app.title = "Sistema ETL para Reservas Hoteleras"
 # ============ Funciones de procesamiento ============
 
 def clean_data(df):
-    #Limpieza de datos adaptada para Dash
-    # Se eliminan columnas problemáticas y se manejan valores nulos
+    """Limpieza de datos adaptada para Dash"""
     if df is None or df.empty:
         return None
     try:
@@ -159,9 +158,7 @@ def train_random_forest(df):
         model = RandomForestClassifier(
             n_estimators=1000,   # Número de árboles
             max_depth=15,        # Profundidad máxima de los árboles
-            min_samples_split=10,  # Mínimo de muestras para dividir un nodo
-            min_samples_leaf=5,  # Mínimo de muestras en una hoja
-            max_features='sqrt',  # Número máximo de características a considerar
+            min_samples_split=150,  # Mínimo de muestras para dividir un nodo
             class_weight='balanced',
             random_state=42,
             n_jobs=-1
@@ -272,18 +269,20 @@ app.layout = dbc.Container([
                 dcc.Upload(
                     id='upload-data',
                     children=html.Div([
-                        'Arrastra y suelta o ',
+                        html.Span('Arrastra y suelta o '),
                         html.A('Selecciona un archivo')
                     ]),
                     style={
-                        'width': '100%',
+                        'width': '80%',
                         'height': '60px',
+                        'display': 'flex',
                         'lineHeight': '60px',
                         'borderWidth': '1px',
                         'borderStyle': 'dashed',
                         'borderRadius': '5px',
                         'textAlign': 'center',
-                        'margin': '10px'
+                        'margin': '10px auto',
+                        'alingnItemnts' : 'center'
                     },
                     multiple=False
                 ),
@@ -544,11 +543,16 @@ def update_output(contents, filename, last_modified):
         elif 'xls' in filename:
             df = pd.read_excel(io.BytesIO(decoded))
         elif 'json' in filename:
-            # Manejar diferentes formatos JSON
+            # Intentar leer como JSON normal
             try:
                 df = pd.read_json(io.StringIO(decoded.decode('utf-8')))
-            except:
-                df = pd.json_normalize(json.loads(decoded))
+            except ValueError:
+                # Intentar leer como JSON por líneas (NDJSON/JSONL)
+                try:
+                    df = pd.read_json(io.StringIO(decoded.decode('utf-8')), lines=True)
+                except Exception:
+                    # Último recurso: normalizar
+                    df = pd.json_normalize(json.loads(decoded))
         else:
             return [html.Div("Formato de archivo no soportado"), None, None, [], [], []]
         
@@ -1125,11 +1129,28 @@ def apply_clustering(n_clicks, feature_pair):
         for cluster_id in range(3):
             x_mean = cluster_stats.loc[cluster_id, f'{x_col}_mean']
             y_mean = cluster_stats.loc[cluster_id, f'{y_col}_mean']
+            x_std = cluster_stats.loc[cluster_id, f'{x_col}_std']
+            y_std = cluster_stats.loc[cluster_id, f'{y_col}_std']
+            x_count = cluster_stats.loc[cluster_id, f'{x_col}_count']
+
+            #comparar con la media global
+            x_global_mean = features[x_col].mean()
+            y_global_mean = features[y_col].mean()
+
+            # Descripción simple para x_desc e y_desc
+            x_desc = "mayor que la media" if x_mean > x_global_mean else "menor o igual a la media"
+            y_desc = "mayor que la media" if y_mean > y_global_mean else "menor o igual a la media"
             
-            x_level = "bajos" if x_mean < features[x_col].quantile(0.33) else "medios" if x_mean < features[x_col].quantile(0.66) else "altos"
-            y_level = "bajos" if y_mean < features[y_col].quantile(0.33) else "medios" if y_mean < features[y_col].quantile(0.66) else "altos"
+            #x_level = "bajos" if x_mean < features[x_col].quantile(0.33) else "medios" if x_mean < features[x_col].quantile(0.66) else "altos"
+            #y_level = "bajos" if y_mean < features[y_col].quantile(0.33) else "medios" if y_mean < features[y_col].quantile(0.66) else "altos"
             
-            interpretations.append(f"Cluster {cluster_id}: Valores {x_level} en {x_col.replace('_', ' ')} y {y_level} en {y_col.replace('_', ' ')}")
+            interpretations.append(
+                f"Cluster {cluster_id}: {x_count} reservas. "
+                f"{x_col.replace('_', ' ').title()} promedio {x_desc} ({x_mean:.2f}, global: {x_global_mean:.2f}), "
+                f"{y_col.replace('_', ' ').title()} promedio {y_desc} ({y_mean:.2f}, global: {y_global_mean:.2f})." # type: ignore
+            )
+
+            #interpretations.append(f"Cluster {cluster_id}: Valores {x_level} en {x_col.replace('_', ' ')} y {y_level} en {y_col.replace('_', ' ')}")
         
         summary = html.Div([
             html.H5("Resumen de Clusters:", className="mb-3"),
